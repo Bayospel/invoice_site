@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Invoice Sender</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#f4f6fb;color:#1b2540;margin:0;padding:16px}
+  main{max-width:640px;margin:0 auto}
+  h1{color:#14284b;font-size:1.5rem}
+  section{background:#fff;border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 3px #0001}
+  h2{font-size:1rem;margin:0 0 10px;color:#14284b}
+  label{display:block;font-size:.85rem;margin:10px 0 4px}
+  input,textarea{width:100%;box-sizing:border-box;padding:8px;border:1px solid #c5cde0;border-radius:6px;font:inherit}
+  .row{display:flex;gap:10px}.row>div{flex:1}
+  button{padding:10px 16px;border:0;border-radius:6px;font:inherit;cursor:pointer;margin-right:8px}
+  #preview{background:#dfe6f5;color:#14284b}#send{background:#14284b;color:#fff}
+  button:disabled{opacity:.5;cursor:default}
+  pre{background:#0f1a30;color:#d7e2ff;padding:12px;border-radius:8px;white-space:pre-wrap;max-height:320px;overflow:auto;font-size:.8rem}
+  small{color:#5a6785}
+</style>
+</head>
+<body>
+<main>
+<h1>Invoice Sender</h1>
+<form id="f">
+  <section>
+    <h2>1. Files</h2>
+    <label>Customer list (.txt or .pdf)</label>
+    <input type="file" name="contacts" accept=".txt,.pdf" required>
+    <small>One per line: email | name | company</small>
+    <label>Invoice template (.pdf)</label>
+    <input type="file" name="invoice" accept=".pdf" required>
+    <small>Use {{NAME}}, {{COMPANY}} and {{ADDRESS}} where they should appear</small>
+  </section>
+  <section>
+    <h2>2. Email message</h2>
+    <textarea name="message" rows="7">Subject: Your invoice, {name}
+
+Hi {name},
+
+Please find attached your invoice for {company}.
+
+Thank you!</textarea>
+    <small>You can use {name}, {company} and {address}</small>
+  </section>
+  <section>
+    <h2>3. Connect your mailer (SMTP)</h2>
+    <div class="row">
+      <div><label>Host</label><input name="host" placeholder="smtp.gmail.com"></div>
+      <div><label>Port</label><input name="port" value="587"></div>
+    </div>
+    <label>Username (also the From address)</label>
+    <input name="user" placeholder="you@gmail.com" autocomplete="off">
+    <label>Password / app password</label>
+    <input name="pass" type="password" autocomplete="off">
+    <small>Used only for this run and never saved. Gmail needs an app password.</small>
+  </section>
+  <section>
+    <button type="button" id="preview">Preview (no emails sent)</button>
+    <button type="button" id="send">Send emails</button>
+    <a id="dl" href="#" hidden>Download preview PDFs</a>
+  </section>
+</form>
+<section><h2>Progress</h2><pre id="log">Nothing running yet.</pre></section>
+</main>
+<script>
+const f = document.getElementById('f'), log = document.getElementById('log');
+const btns = [preview, send];
+async function run(mode) {
+  if (mode === 'send' && !confirm('Send a real email to every customer in the list?')) return;
+  const fd = new FormData(f); fd.append('mode', mode);
+  btns.forEach(b => b.disabled = true); dl.hidden = true; log.textContent = '';
+  const r = await fetch('/start', {method: 'POST', body: fd}); const j = await r.json();
+  if (!r.ok) { log.textContent = j.error; btns.forEach(b => b.disabled = false); return; }
+  let since = 0;
+  const t = setInterval(async () => {
+    const s = await (await fetch(`/status/${j.id}?since=${since}`)).json();
+    if (s.log.length) { log.textContent += s.log.join('\n') + '\n'; log.scrollTop = log.scrollHeight; }
+    since = s.next;
+    if (!s.running) {
+      clearInterval(t); btns.forEach(b => b.disabled = false);
+      if (!s.send) { dl.href = `/download/${j.id}`; dl.hidden = false; }
+    }
+  }, 1000);
+}
+preview.onclick = () => run('preview'); send.onclick = () => run('send');
+</script>
+</body>
+</html>
