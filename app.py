@@ -4,7 +4,7 @@ Flask front end for the invoice sender.
 The browser uploads three files (contacts list, invoice PDF template,
 email message) and clicking "Send Invoices" processes the contacts,
 looks up addresses, populates the PDF invoice, and sends the email with
-the invoice attached via standard SMTP.
+the invoice attached via standard SMTP with automatic port fallback (465 / 587).
 """
 import io
 import os
@@ -25,8 +25,8 @@ from reportlab.pdfgen import canvas
 app = Flask(__name__)
 
 # SMTP Settings from Environment Variables
-SMTP_HOST = os.environ.get("SMTP_HOST", "mail.alphaprotectionspecialoperation.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+SMTP_HOST = os.environ.get("SMTP_HOST", "d7.my-control-panel.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 465))
 SMTP_USER = os.environ.get("SMTP_USER", "accounting@alphaprotectionspecialoperation.com")
 SMTP_PASS = os.environ.get("SMTP_PASS", "Password1234")
 FROM_NAME = os.environ.get("FROM_NAME", "Account Department")
@@ -295,17 +295,31 @@ def send_invoices():
 
     run = {"results": [], "sent": 0, "failed": 0, "total": len(contacts), "account_issue": None}
 
-    # Initialize SMTP connection
+    # Robust SMTP Connection with 465 (SSL) and 587 (STARTTLS) automatic fallback
     server = None
-    try:
-        if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
-        else:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-            server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-    except Exception as e:
-        run["account_issue"] = f"Could not connect or authenticate with SMTP server ({SMTP_HOST}:{SMTP_PORT}): {e}"
+    connection_error = None
+    
+    ports_to_try = [465, 587] if SMTP_PORT not in ports_to_try else [SMTP_PORT, 465 if SMTP_PORT == 587 else 587]
+
+    for port in ports_to_try:
+        try:
+            if port == 465:
+                server = smtplib.SMTP_SSL(SMTP_HOST, port, timeout=10)
+            else:
+                server = smtplib.SMTP(SMTP_HOST, port, timeout=10)
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+            
+            server.login(SMTP_USER, SMTP_PASS)
+            break  # Connection successful! Exit loop.
+        except Exception as e:
+            connection_error = e
+            server = None
+            continue
+
+    if not server:
+        run["account_issue"] = f"SMTP Connection Failed on all ports ({SMTP_HOST}): {connection_error}"
         return render_template("index.html", run=run, from_address=SMTP_USER)
 
     try:
@@ -322,7 +336,6 @@ def send_invoices():
                     "email": c["email"],
                 }
                 
-                # Format PDF values with Customer Contact string
                 customer_contact_field = f"{c['name']} ({c['email']})"
                 pdf_values = {**values, "name": customer_contact_field}
                 pdf_bytes = make_invoice(invoice_bytes, pdf_values, locations)
@@ -330,7 +343,6 @@ def send_invoices():
                 safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
                 fname = f"Invoice_{safe}.pdf"
 
-                # Construct Email message
                 msg = EmailMessage()
                 msg["From"] = formataddr((FROM_NAME, SMTP_USER))
                 msg["To"] = c["email"]
