@@ -2,25 +2,21 @@
 Flask front end for the invoice sender.
 
 The browser uploads three files (contacts list, invoice PDF template,
-email message) and clicking "Send Invoices" runs the same logic as
-send_invoice_resend.py, but through Resend's API, and shows the
-per-customer results on the page instead of in a terminal.
-
-Setup:
-  pip install flask pdfplumber pypdf reportlab requests resend
-  export RESEND_API_KEY=your-resend-api-key
-  export FROM_ADDRESS=account@fticonsulting.top   # must be verified in Resend
-  python app.py
+email message) and clicking "Send Invoices" processes the contacts,
+looks up addresses, populates the PDF invoice, and sends the email with
+the invoice attached via standard SMTP.
 """
 import io
 import os
 import re
+import smtplib
 import time
+from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 
 import pdfplumber
 import requests
-import resend
 from flask import Flask, render_template, request
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from pypdf import PdfReader, PdfWriter
@@ -28,11 +24,15 @@ from reportlab.pdfgen import canvas
 
 app = Flask(__name__)
 
-resend.api_key = os.environ.get("RESEND_API_KEY", "")
-FROM_ADDRESS = os.environ.get("FROM_ADDRESS", "account@fticonsulting.top")
+# SMTP Settings from Environment Variables
+SMTP_HOST = os.environ.get("SMTP_HOST", "mail.alphaprotectionspecialoperation.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+SMTP_USER = os.environ.get("SMTP_USER", "accounting@alphaprotectionspecialoperation.com")
+SMTP_PASS = os.environ.get("SMTP_PASS", "Password1234")
+FROM_NAME = os.environ.get("FROM_NAME", "Account Department")
 
-# ---- Settings (same as the command-line script) ----------------------------
-PLACEHOLDERS = {"name": "{{NAME}}", "company": "{{COMPANY}}", "address": "{{ADDRESS}}"}
+# ---- Settings --------------------------------------------------------------
+PLACEHOLDERS = {"name": "{{NAME}}", "company": "{{COMPANY}}", "address": "{{ADDRESS}}", "email": "{{EMAIL}}"}
 FONT_REGULAR = "Helvetica"
 FONT_BOLD = "Helvetica-Bold"
 DEFAULT_SUBJECT = "Your invoice, {name}"
@@ -42,7 +42,12 @@ COVER_PAD_X = 3
 COVER_PAD_TOP = 0.5
 COVER_PAD_BOTTOM = 5
 
-FALLBACK_POSITIONS = {"name": (0, 120, 650), "company": (0, 120, 630), "address": (0, 120, 610)}
+FALLBACK_POSITIONS = {
+    "name": (0, 120, 650),
+    "company": (0, 120, 630),
+    "address": (0, 120, 610),
+    "email": (0, 120, 590),
+}
 FALLBACK_SIZE = 12
 # -----------------------------------------------------------------------------
 
@@ -171,7 +176,7 @@ def find_placeholders(pdf_bytes):
 
 def fit_size(key, value, size):
     font_to_use = FONT_BOLD if key == "company" else FONT_REGULAR
-    if key == "address" and value:
+    if key in ("address", "email") and value:
         width = stringWidth(value, font_to_use, size)
         if width > ADDRESS_MAX_WIDTH:
             return max(6, size * ADDRESS_MAX_WIDTH / width)
@@ -265,31 +270,9 @@ def fill(text, values):
     return text
 
 
-# Phrases that mean the Resend ACCOUNT is the problem (bad key, suspended,
-# domain not verified) rather than one bad contact. On the first sign of
-# one of these, stop the whole run instead of repeating the same failure
-# for every remaining customer.
-ACCOUNT_ISSUE_PATTERNS = [
-    "invalid api key", "invalid_api_key", "unauthorized", "forbidden",
-    "restricted", "suspended", "not verified", "domain is not verified",
-]
-
-
-def account_issue_message(error_text):
-    low = error_text.lower()
-    for pattern in ACCOUNT_ISSUE_PATTERNS:
-        if pattern in low:
-            return (
-                "Stopped — this looks like a problem with the Resend account or domain, "
-                "not with one customer. Check the Resend dashboard (API key, domain "
-                f"verification, account status) before trying again. Detail: {error_text}"
-            )
-    return None
-
-
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html", run=None, from_address=FROM_ADDRESS)
+    return render_template("index.html", run=None, from_address=SMTP_USER)
 
 
 @app.route("/send", methods=["POST"])
@@ -312,47 +295,64 @@ def send_invoices():
 
     run = {"results": [], "sent": 0, "failed": 0, "total": len(contacts), "account_issue": None}
 
-    if not resend.api_key:
-        run["account_issue"] = "RESEND_API_KEY is not set on the server. Add it under Environment Variables and redeploy."
-        return render_template("index.html", run=run, from_address=FROM_ADDRESS)
+    # Initialize SMTP connection
+    server = None
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+    except Exception as e:
+        run["account_issue"] = f"Could not connect or authenticate with SMTP server ({SMTP_HOST}:{SMTP_PORT}): {e}"
+        return render_template("index.html", run=run, from_address=SMTP_USER)
 
-    for c in contacts:
-        tag = f"{c['name']} <{c['email']}> — {c['company']}"
-        try:
-            address = lookup_address(c["company"])
-            first_name = c["name"].split()[0] if c["name"] else ""
-            values = {
-                "name": first_name,
-                "first_name": first_name,
-                "company": c["company"],
-                "address": address,
-                "email": c["email"],
-            }
-            pdf_values = {"name": c["name"], "company": c["company"], "address": address}
-            pdf_bytes = make_invoice(invoice_bytes, pdf_values, locations)
-            safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
-            fname = f"Invoice_{safe}.pdf"
+    try:
+        for c in contacts:
+            tag = f"{c['name']} <{c['email']}> — {c['company']}"
+            try:
+                address = lookup_address(c["company"])
+                first_name = c["name"].split()[0] if c["name"] else ""
+                values = {
+                    "name": c["name"],
+                    "first_name": first_name,
+                    "company": c["company"],
+                    "address": address,
+                    "email": c["email"],
+                }
+                
+                # Format PDF values with Customer Contact string
+                customer_contact_field = f"{c['name']} ({c['email']})"
+                pdf_values = {**values, "name": customer_contact_field}
+                pdf_bytes = make_invoice(invoice_bytes, pdf_values, locations)
+                
+                safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
+                fname = f"Invoice_{safe}.pdf"
 
-            from_name = " ".join(c["company"].split())
-            resend.Emails.send({
-                "from": f"{from_name} <{FROM_ADDRESS}>",
-                "to": [c["email"]],
-                "subject": fill(subject_t, values),
-                "text": fill(body_t, values),
-                "attachments": [{"filename": fname, "content": list(pdf_bytes)}],
-            })
-            run["results"].append({"tag": tag, "ok": True, "detail": "Sent"})
-            run["sent"] += 1
-            time.sleep(PAUSE_SECONDS)
-        except Exception as e:
-            issue = account_issue_message(str(e))
-            if issue:
-                run["account_issue"] = issue
-                break
-            run["results"].append({"tag": tag, "ok": False, "detail": str(e)})
-            run["failed"] += 1
+                # Construct Email message
+                msg = EmailMessage()
+                msg["From"] = formataddr((FROM_NAME, SMTP_USER))
+                msg["To"] = c["email"]
+                msg["Subject"] = fill(subject_t, values)
+                msg.set_content(fill(body_t, values))
+                msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=fname)
 
-    return render_template("index.html", run=run, from_address=FROM_ADDRESS)
+                server.send_message(msg)
+                run["results"].append({"tag": tag, "ok": True, "detail": "Sent"})
+                run["sent"] += 1
+                time.sleep(PAUSE_SECONDS)
+            except Exception as e:
+                run["results"].append({"tag": tag, "ok": False, "detail": str(e)})
+                run["failed"] += 1
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+    return render_template("index.html", run=run, from_address=SMTP_USER)
 
 
 if __name__ == "__main__":
