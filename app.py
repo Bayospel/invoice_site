@@ -1,181 +1,330 @@
 """
-Invoice sender website. Wraps send_invoices_v4.py in a web page.
+Flask front end for the invoice sender.
 
-Run locally:  pip install -r requirements.txt && python app.py   (opens on http://localhost:5000)
-Environment:  GOOGLE_API_KEY or GEOAPIFY_API_KEY  (optional; address lookup falls back to OpenStreetMap)
-              APP_PASSWORD    (login password for the site; SET THIS if the site is online)
+The browser uploads three files (contacts list, invoice PDF template,
+email message) and clicking "Send Invoices" runs the same logic as
+send_invoice_resend.py, but through Resend's API, and shows the
+per-customer results on the page instead of in a terminal.
+
+Setup:
+  pip install flask pdfplumber pypdf reportlab requests resend
+  export RESEND_API_KEY=your-resend-api-key
+  export FROM_ADDRESS=account@fticonsulting.top   # must be verified in Resend
+  python app.py
 """
-import contextlib
 import io
 import os
 import re
-import shutil
-import smtplib
-import tempfile
-import threading
 import time
-import uuid
-from email.message import EmailMessage
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template, request, send_file
-
-import send_invoices_v4 as inv
+import pdfplumber
+import requests
+import resend
+from flask import Flask, render_template, request
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
-APP_PASSWORD = os.environ.get("APP_PASSWORD")
-JOBS = {}
+
+resend.api_key = os.environ.get("RESEND_API_KEY", "")
+FROM_ADDRESS = os.environ.get("FROM_ADDRESS", "account@fticonsulting.top")
+
+# ---- Settings (same as the command-line script) ----------------------------
+PLACEHOLDERS = {"name": "{{NAME}}", "company": "{{COMPANY}}", "address": "{{ADDRESS}}"}
+FONT_REGULAR = "Helvetica"
+FONT_BOLD = "Helvetica-Bold"
+DEFAULT_SUBJECT = "Your invoice, {name}"
+PAUSE_SECONDS = 1   # wait between emails
+
+COVER_PAD_X = 3
+COVER_PAD_TOP = 0.5
+COVER_PAD_BOTTOM = 5
+
+FALLBACK_POSITIONS = {"name": (0, 120, 650), "company": (0, 120, 630), "address": (0, 120, 610)}
+FALLBACK_SIZE = 12
+# -----------------------------------------------------------------------------
+
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GEOAPIFY_API_KEY = os.environ.get("GEOAPIFY_API_KEY")
+GEOAPIFY_URL = "https://api.geoapify.com/v1/geocode/search"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_last_nominatim_call = [0.0]
+PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
+ADDRESS_CACHE = {}
+ADDRESS_MAX_WIDTH = 280
 
 
-@app.before_request
-def require_login():
-    if APP_PASSWORD:
-        a = request.authorization
-        if not a or a.password != APP_PASSWORD:
-            return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Invoices"'})
+def read_text_bytes(data, is_pdf):
+    if is_pdf:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    return data.decode("utf-8", errors="ignore")
 
 
-@contextlib.contextmanager
-def captured(log):
-    """The v4 functions print() their warnings; show those in the web log instead."""
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        yield
-    for line in buf.getvalue().splitlines():
-        if line.strip():
-            log(line.strip())
-
-
-def connect(cfg):
-    port = int(cfg["port"])
-    if port == 465:
-        server = smtplib.SMTP_SSL(cfg["host"], port, timeout=30)
-    else:
-        server = smtplib.SMTP(cfg["host"], port, timeout=30)
-        server.starttls()
-    server.login(cfg["user"], cfg["pass"])
-    return server
-
-
-def run_job(job, d, cfg, send):
-    log = job["log"].append
-    server = None
-    try:
-        with captured(log):
-            contacts = inv.parse_contacts(job["contacts"])
-            locations = inv.find_placeholders(job["invoice"])
-        subject_t, body_t = inv.load_email_template(job["message"])
-        for key, ph in inv.PLACEHOLDERS.items():
-            status = f"found {len(locations[key])}x" if locations[key] else "NOT FOUND, using fallback position"
-            log(f"Invoice placeholder {ph}: {status}")
-        log(f"Contacts found: {len(contacts)}")
-        log(f"Address lookup: {inv.provider_name()}")
-        if send:
-            server = connect(cfg)
-            log("Mail server connected")
-
-        out = d / "generated"
-        out.mkdir()
-        for i, c in enumerate(contacts, 1):
-            tag = f"[{i}/{len(contacts)}] {c['name']} ({c['company']}) <{c['email']}>"
-            try:
-                with captured(log):
-                    address = inv.lookup_address(c["company"])
-                if not address:
-                    log(f"  WARNING no address found for {c['company']}")
-                values = {"name": c["name"], "company": c["company"], "address": address}
-                pdf_bytes = inv.make_invoice(job["invoice"], values, locations)
-                safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
-                fname = f"Invoice_{safe}.pdf"
-                if (out / fname).exists():
-                    fname = f"Invoice_{safe}_{i}.pdf"
-                (out / fname).write_bytes(pdf_bytes)
-                if send:
-                    msg = EmailMessage()
-                    msg["From"] = cfg["user"]
-                    msg["To"] = c["email"]
-                    msg["Subject"] = inv.fill(subject_t, values)
-                    msg.set_content(inv.fill(body_t, values))
-                    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=fname)
-                    server.send_message(msg)
-                    log(f"SENT    {tag}")
-                    time.sleep(inv.PAUSE_SECONDS)
-                else:
-                    log(f"PREVIEW {tag}")
-            except Exception as e:
-                log(f"ERROR   {tag}: {e}")
-    except Exception as e:
-        log(f"FAILED: {e}")
-    finally:
-        if server:
-            try:
-                server.quit()
-            except Exception:
-                pass
-        # Don't keep customer data on the server after a real send.
-        if send:
-            shutil.rmtree(d, ignore_errors=True)
+def parse_contacts(data, is_pdf):
+    contacts, seen = [], set()
+    for line in read_text_bytes(data, is_pdf).splitlines():
+        m = EMAIL_RE.search(line)
+        if not m:
+            continue
+        email = m.group(0)
+        rest = line[:m.start()] + "," + line[m.end():]
+        if "|" in line:
+            splitter = r"\|+"
+        elif "\t" in line:
+            splitter = r"\t+"
         else:
-            Path(job["contacts"]).unlink(missing_ok=True)
-        job["running"] = False
-        log("DONE")
+            splitter = r"[,;]+"
+        rest = rest.replace(",", " ", 1) if splitter != r"[,;]+" else rest
+        fields = [f.strip(" ,") for f in re.split(splitter, rest) if f.strip(" ,")]
+        if len(fields) < 2 or email.lower() in seen:
+            continue
+        seen.add(email.lower())
+        contacts.append({"name": fields[0], "company": ", ".join(fields[1:]) if splitter == r"[,;]+" else fields[1], "email": email})
+    return contacts
 
 
-@app.get("/")
+def provider_name():
+    if GOOGLE_API_KEY:
+        return "Google Places"
+    if GEOAPIFY_API_KEY:
+        return "Geoapify"
+    return "OpenStreetMap"
+
+
+def _google_address(company):
+    r = requests.post(
+        PLACES_URL,
+        headers={"X-Goog-Api-Key": GOOGLE_API_KEY, "X-Goog-FieldMask": "places.displayName,places.formattedAddress"},
+        json={"textQuery": company, "pageSize": 1}, timeout=10,
+    )
+    r.raise_for_status()
+    places = r.json().get("places", [])
+    return places[0]["formattedAddress"] if places else ""
+
+
+def _geoapify_address(company):
+    r = requests.get(GEOAPIFY_URL, params={"text": company, "limit": 1, "format": "json", "apiKey": GEOAPIFY_API_KEY}, timeout=10)
+    r.raise_for_status()
+    results = r.json().get("results", [])
+    if not results:
+        return ""
+    hit = results[0]
+    if hit.get("name") and hit.get("address_line2"):
+        return hit["address_line2"]
+    return hit.get("formatted", "")
+
+
+def _nominatim_address(company):
+    wait = 1.1 - (time.time() - _last_nominatim_call[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_nominatim_call[0] = time.time()
+    r = requests.get(
+        NOMINATIM_URL,
+        params={"q": company, "format": "jsonv2", "addressdetails": 1, "limit": 1},
+        headers={"User-Agent": "invoice-sender-site/1.0"}, timeout=15,
+    )
+    r.raise_for_status()
+    results = r.json()
+    if not results:
+        return ""
+    a = results[0].get("address", {})
+    street = " ".join(x for x in (a.get("house_number"), a.get("road")) if x)
+    place = a.get("city") or a.get("town") or a.get("village") or a.get("suburb") or a.get("county")
+    parts = [street, place, a.get("state"), a.get("postcode"), a.get("country")]
+    return ", ".join(p for p in parts if p) or results[0].get("display_name", "")
+
+
+def lookup_address(company):
+    key = company.strip().lower()
+    if key in ADDRESS_CACHE:
+        return ADDRESS_CACHE[key]
+    address = ""
+    try:
+        if GOOGLE_API_KEY:
+            address = _google_address(company)
+        elif GEOAPIFY_API_KEY:
+            address = _geoapify_address(company)
+        else:
+            address = _nominatim_address(company)
+    except Exception:
+        pass
+    ADDRESS_CACHE[key] = address
+    return address
+
+
+def find_placeholders(pdf_bytes):
+    found = {k: [] for k in PLACEHOLDERS}
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for pi, page in enumerate(pdf.pages):
+            for key, ph in PLACEHOLDERS.items():
+                for hit in page.search(re.escape(ph)):
+                    size = hit["chars"][0].get("size", FALLBACK_SIZE) if hit.get("chars") else FALLBACK_SIZE
+                    found[key].append((pi, hit["x0"], hit["x1"], hit["top"], hit["bottom"], size))
+    return found
+
+
+def fit_size(key, value, size):
+    font_to_use = FONT_BOLD if key == "company" else FONT_REGULAR
+    if key == "address" and value:
+        width = stringWidth(value, font_to_use, size)
+        if width > ADDRESS_MAX_WIDTH:
+            return max(6, size * ADDRESS_MAX_WIDTH / width)
+    return size
+
+
+def make_invoice(template_bytes, values, locations):
+    reader = PdfReader(io.BytesIO(template_bytes))
+    ops = {i: [] for i in range(len(reader.pages))}
+
+    for key, value in values.items():
+        if key not in PLACEHOLDERS:
+            continue
+        spots = locations[key]
+        font_style = FONT_BOLD if key == "company" else FONT_REGULAR
+        text_color = (0.1, 0.1, 0.1) if key == "company" else (0.2, 0.2, 0.2)
+
+        if spots:
+            for pi, x0, x1, top, bottom, size in spots:
+                ph = float(reader.pages[pi].mediabox.height)
+                ops[pi].append((
+                    "cover",
+                    x0 - COVER_PAD_X,
+                    ph - bottom - COVER_PAD_BOTTOM,
+                    (x1 - x0) + 2 * COVER_PAD_X,
+                    (bottom - top) + COVER_PAD_TOP + COVER_PAD_BOTTOM,
+                ))
+                ops[pi].append(("text", x0, ph - bottom + size * 0.2, value, fit_size(key, value, size), font_style, text_color))
+        else:
+            pi, x, y = FALLBACK_POSITIONS[key]
+            ops[pi].append(("text", x, y, value, fit_size(key, value, FALLBACK_SIZE), font_style, text_color))
+
+    writer = PdfWriter()
+    for i, src in enumerate(reader.pages):
+        page = writer.add_page(src)
+        if ops[i]:
+            w, h = float(page.mediabox.width), float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=(w, h))
+            for op in ops[i]:
+                if op[0] == "cover":
+                    c.setFillColorRGB(1, 1, 1)
+                    c.rect(op[1], op[2], op[3], op[4], stroke=0, fill=1)
+            for op in ops[i]:
+                if op[0] == "text":
+                    c.setFont(op[5], op[4])
+                    c.setFillColorRGB(*op[6])
+                    c.drawString(op[1], op[2], op[3])
+            c.save()
+            buf.seek(0)
+            page.merge_page(PdfReader(buf).pages[0])
+
+    for page in writer.pages:
+        refs = page.get("/Contents")
+        refs = refs.get_object() if hasattr(refs, "get_object") else refs
+        if not isinstance(refs, list):
+            refs = [refs]
+        for ref in refs:
+            obj = ref.get_object() if hasattr(ref, "get_object") else ref
+            if not hasattr(obj, "get_data"):
+                continue
+            data = obj.get_data()
+            new = data
+            for ph in PLACEHOLDERS.values():
+                for enc in ["utf-8", "latin-1", "utf-16be"]:
+                    try:
+                        raw = ph.encode(enc)
+                        new = new.replace(raw, b" " * len(raw))
+                    except Exception:
+                        pass
+            if new != data:
+                obj.set_data(new)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def load_email_template(data):
+    text = data.decode("utf-8-sig", errors="ignore").lstrip()
+    subject = DEFAULT_SUBJECT
+    if text.lower().startswith("subject:"):
+        first, _, text = text.partition("\n")
+        subject = first.split(":", 1)[1].strip()
+    return subject, text.lstrip("\n")
+
+
+def fill(text, values):
+    for k, v in values.items():
+        text = text.replace("{" + k + "}", v)
+    return text
+
+
+@app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html")
+    return render_template("index.html", results=None, from_address=FROM_ADDRESS)
 
 
-@app.post("/start")
-def start():
-    if any(j["running"] for j in JOBS.values()):
-        return jsonify(error="A job is already running."), 409
-    files = request.files
-    if not all(k in files and files[k].filename for k in ("contacts", "invoice")):
-        return jsonify(error="Please upload the contacts list and the invoice template."), 400
-    send = request.form.get("mode") == "send"
-    cfg = {k: request.form.get(k, "").strip() for k in ("host", "port", "user")}
-    cfg["pass"] = request.form.get("pass", "")
-    if send:
-        if not all(cfg.values()) or not cfg["port"].isdigit():
-            return jsonify(error="Fill in the mail server host, port, username and password."), 400
+@app.route("/send", methods=["POST"])
+def send():
+    contacts_file = request.files["contacts"]
+    invoice_file = request.files["invoice"]
+    message_file = request.files["message"]
+    fixed_subject = request.form.get("fixed_subject", "").strip()
 
-    d = Path(tempfile.mkdtemp())
-    paths = {
-        "contacts": d / ("contacts" + (Path(files["contacts"].filename).suffix.lower() or ".txt")),
-        "invoice": d / "invoice.pdf",
-        "message": d / "message.txt",
-    }
-    files["contacts"].save(paths["contacts"])
-    files["invoice"].save(paths["invoice"])
-    paths["message"].write_text(request.form.get("message", ""), encoding="utf-8")
+    contacts_bytes = contacts_file.read()
+    is_pdf = contacts_file.filename.lower().endswith(".pdf")
+    invoice_bytes = invoice_file.read()
+    message_bytes = message_file.read()
 
-    job_id = uuid.uuid4().hex
-    job = {"log": [], "running": True, "send": send, "dir": d, **{k: str(v) for k, v in paths.items()}}
-    JOBS[job_id] = job
-    threading.Thread(target=run_job, args=(job, d, cfg, send), daemon=True).start()
-    return jsonify(id=job_id)
+    contacts = parse_contacts(contacts_bytes, is_pdf)
+    locations = find_placeholders(invoice_bytes)
+    subject_t, body_t = load_email_template(message_bytes)
+    if fixed_subject:
+        subject_t = fixed_subject
 
+    results = []
+    if send and not resend.api_key:
+        results.append({"tag": "setup", "status": "ERROR: RESEND_API_KEY is not set on the server"})
+        return render_template("index.html", results=results, from_address=FROM_ADDRESS)
 
-@app.get("/status/<job_id>")
-def status(job_id):
-    job = JOBS.get(job_id)
-    if not job:
-        return jsonify(error="Unknown job"), 404
-    since = int(request.args.get("since", 0))
-    return jsonify(log=job["log"][since:], next=len(job["log"]), running=job["running"], send=job["send"])
+    for c in contacts:
+        tag = f"{c['name']} ({c['company']}) <{c['email']}>"
+        try:
+            address = lookup_address(c["company"])
+            first_name = c["name"].split()[0] if c["name"] else ""
+            values = {
+                "name": first_name,
+                "first_name": first_name,
+                "company": c["company"],
+                "address": address,
+                "email": c["email"],
+            }
+            pdf_values = {"name": c["name"], "company": c["company"], "address": address}
+            pdf_bytes = make_invoice(invoice_bytes, pdf_values, locations)
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
+            fname = f"Invoice_{safe}.pdf"
 
+            from_name = " ".join(c["company"].split())
+            resend.Emails.send({
+                "from": f"{from_name} <{FROM_ADDRESS}>",
+                "to": [c["email"]],
+                "subject": fill(subject_t, values),
+                "text": fill(body_t, values),
+                "attachments": [{"filename": fname, "content": list(pdf_bytes)}],
+            })
+            results.append({"tag": tag, "status": "SENT"})
+            time.sleep(PAUSE_SECONDS)
+        except Exception as e:
+            results.append({"tag": tag, "status": f"ERROR: {e}"})
 
-@app.get("/download/<job_id>")
-def download(job_id):
-    job = JOBS.get(job_id)
-    if not job or job["send"] or job["running"]:
-        return "Not available", 404
-    zip_base = str(Path(job["dir"]) / "preview")
-    shutil.make_archive(zip_base, "zip", Path(job["dir"]) / "generated")
-    return send_file(zip_base + ".zip", as_attachment=True, download_name="preview_invoices.zip")
+    return render_template("index.html", results=results, from_address=FROM_ADDRESS)
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000)
+    app.run(debug=True)
