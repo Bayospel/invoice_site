@@ -265,13 +265,35 @@ def fill(text, values):
     return text
 
 
+# Phrases that mean the Resend ACCOUNT is the problem (bad key, suspended,
+# domain not verified) rather than one bad contact. On the first sign of
+# one of these, stop the whole run instead of repeating the same failure
+# for every remaining customer.
+ACCOUNT_ISSUE_PATTERNS = [
+    "invalid api key", "invalid_api_key", "unauthorized", "forbidden",
+    "restricted", "suspended", "not verified", "domain is not verified",
+]
+
+
+def account_issue_message(error_text):
+    low = error_text.lower()
+    for pattern in ACCOUNT_ISSUE_PATTERNS:
+        if pattern in low:
+            return (
+                "Stopped — this looks like a problem with the Resend account or domain, "
+                "not with one customer. Check the Resend dashboard (API key, domain "
+                f"verification, account status) before trying again. Detail: {error_text}"
+            )
+    return None
+
+
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html", results=None, from_address=FROM_ADDRESS)
+    return render_template("index.html", run=None, from_address=FROM_ADDRESS)
 
 
 @app.route("/send", methods=["POST"])
-def send():
+def send_invoices():
     contacts_file = request.files["contacts"]
     invoice_file = request.files["invoice"]
     message_file = request.files["message"]
@@ -288,13 +310,14 @@ def send():
     if fixed_subject:
         subject_t = fixed_subject
 
-    results = []
-    if send and not resend.api_key:
-        results.append({"tag": "setup", "status": "ERROR: RESEND_API_KEY is not set on the server"})
-        return render_template("index.html", results=results, from_address=FROM_ADDRESS)
+    run = {"results": [], "sent": 0, "failed": 0, "total": len(contacts), "account_issue": None}
+
+    if not resend.api_key:
+        run["account_issue"] = "RESEND_API_KEY is not set on the server. Add it under Environment Variables and redeploy."
+        return render_template("index.html", run=run, from_address=FROM_ADDRESS)
 
     for c in contacts:
-        tag = f"{c['name']} ({c['company']}) <{c['email']}>"
+        tag = f"{c['name']} <{c['email']}> — {c['company']}"
         try:
             address = lookup_address(c["company"])
             first_name = c["name"].split()[0] if c["name"] else ""
@@ -318,12 +341,18 @@ def send():
                 "text": fill(body_t, values),
                 "attachments": [{"filename": fname, "content": list(pdf_bytes)}],
             })
-            results.append({"tag": tag, "status": "SENT"})
+            run["results"].append({"tag": tag, "ok": True, "detail": "Sent"})
+            run["sent"] += 1
             time.sleep(PAUSE_SECONDS)
         except Exception as e:
-            results.append({"tag": tag, "status": f"ERROR: {e}"})
+            issue = account_issue_message(str(e))
+            if issue:
+                run["account_issue"] = issue
+                break
+            run["results"].append({"tag": tag, "ok": False, "detail": str(e)})
+            run["failed"] += 1
 
-    return render_template("index.html", results=results, from_address=FROM_ADDRESS)
+    return render_template("index.html", run=run, from_address=FROM_ADDRESS)
 
 
 if __name__ == "__main__":
