@@ -299,7 +299,12 @@ def send_invoices():
     server = None
     connection_error = None
     
-    ports_to_try = [465, 587] if SMTP_PORT not in ports_to_try else [SMTP_PORT, 465 if SMTP_PORT == 587 else 587]
+    if SMTP_PORT == 465:
+        ports_to_try = [465, 587]
+    elif SMTP_PORT == 587:
+        ports_to_try = [587, 465]
+    else:
+        ports_to_try = [SMTP_PORT, 465, 587]
 
     for port in ports_to_try:
         try:
