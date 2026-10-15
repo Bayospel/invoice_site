@@ -4,19 +4,17 @@ Flask front end for the invoice sender.
 The browser uploads three files (contacts list, invoice PDF template,
 email message) and clicking "Send Invoices" processes the contacts,
 looks up addresses, populates the PDF invoice, and sends the email with
-the invoice attached via standard SMTP with automatic port fallback (465 / 587).
+the invoice attached via Resend's API.
 """
 import io
 import os
 import re
-import smtplib
 import time
-from email.message import EmailMessage
-from email.utils import formataddr
 from pathlib import Path
 
 import pdfplumber
 import requests
+import resend
 from flask import Flask, render_template, request
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from pypdf import PdfReader, PdfWriter
@@ -24,12 +22,9 @@ from reportlab.pdfgen import canvas
 
 app = Flask(__name__)
 
-# SMTP Settings from Environment Variables
-SMTP_HOST = os.environ.get("SMTP_HOST", "d7.my-control-panel.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 465))
-SMTP_USER = os.environ.get("SMTP_USER", "accounting@alphaprotectionspecialoperation.com")
-SMTP_PASS = os.environ.get("SMTP_PASS", "Password1234")
-FROM_NAME = os.environ.get("FROM_NAME", "Account Department")
+# Resend API Setup
+resend.api_key = os.environ.get("RESEND_API_KEY", "")
+FROM_ADDRESS = os.environ.get("FROM_ADDRESS", "accounting@alphaprotectionspecialoperation.com")
 
 # ---- Settings --------------------------------------------------------------
 PLACEHOLDERS = {"name": "{{NAME}}", "company": "{{COMPANY}}", "address": "{{ADDRESS}}", "email": "{{EMAIL}}"}
@@ -270,9 +265,27 @@ def fill(text, values):
     return text
 
 
+ACCOUNT_ISSUE_PATTERNS = [
+    "invalid api key", "invalid_api_key", "unauthorized", "forbidden",
+    "restricted", "suspended", "not verified", "domain is not verified",
+]
+
+
+def account_issue_message(error_text):
+    low = error_text.lower()
+    for pattern in ACCOUNT_ISSUE_PATTERNS:
+        if pattern in low:
+            return (
+                "Stopped — this looks like a problem with the Resend account or domain, "
+                "not with one customer. Check the Resend dashboard (API key, domain "
+                f"verification, account status) before trying again. Detail: {error_text}"
+            )
+    return None
+
+
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html", run=None, from_address=SMTP_USER)
+    return render_template("index.html", run=None, from_address=FROM_ADDRESS)
 
 
 @app.route("/send", methods=["POST"])
@@ -295,81 +308,53 @@ def send_invoices():
 
     run = {"results": [], "sent": 0, "failed": 0, "total": len(contacts), "account_issue": None}
 
-    # Robust SMTP Connection with 465 (SSL) and 587 (STARTTLS) automatic fallback
-    server = None
-    connection_error = None
-    
-    if SMTP_PORT == 465:
-        ports_to_try = [465, 587]
-    elif SMTP_PORT == 587:
-        ports_to_try = [587, 465]
-    else:
-        ports_to_try = [SMTP_PORT, 465, 587]
+    # Set Resend API key dynamically from environment
+    resend.api_key = os.environ.get("RESEND_API_KEY", "")
 
-    for port in ports_to_try:
+    if not resend.api_key:
+        run["account_issue"] = "RESEND_API_KEY is not set on the server. Add it under Environment Variables and redeploy."
+        return render_template("index.html", run=run, from_address=FROM_ADDRESS)
+
+    for c in contacts:
+        tag = f"{c['name']} <{c['email']}> — {c['company']}"
         try:
-            if port == 465:
-                server = smtplib.SMTP_SSL(SMTP_HOST, port, timeout=10)
-            else:
-                server = smtplib.SMTP(SMTP_HOST, port, timeout=10)
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
+            address = lookup_address(c["company"])
+            first_name = c["name"].split()[0] if c["name"] else ""
+            values = {
+                "name": c["name"],
+                "first_name": first_name,
+                "company": c["company"],
+                "address": address,
+                "email": c["email"],
+            }
             
-            server.login(SMTP_USER, SMTP_PASS)
-            break  # Connection successful! Exit loop.
+            customer_contact_field = f"{c['name']} ({c['email']})"
+            pdf_values = {**values, "name": customer_contact_field}
+            pdf_bytes = make_invoice(invoice_bytes, pdf_values, locations)
+            
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
+            fname = f"Invoice_{safe}.pdf"
+
+            from_name = " ".join(c["company"].split())
+            resend.Emails.send({
+                "from": f"{from_name} <{FROM_ADDRESS}>",
+                "to": [c["email"]],
+                "subject": fill(subject_t, values),
+                "text": fill(body_t, values),
+                "attachments": [{"filename": fname, "content": list(pdf_bytes)}],
+            })
+            run["results"].append({"tag": tag, "ok": True, "detail": "Sent"})
+            run["sent"] += 1
+            time.sleep(PAUSE_SECONDS)
         except Exception as e:
-            connection_error = e
-            server = None
-            continue
+            issue = account_issue_message(str(e))
+            if issue:
+                run["account_issue"] = issue
+                break
+            run["results"].append({"tag": tag, "ok": False, "detail": str(e)})
+            run["failed"] += 1
 
-    if not server:
-        run["account_issue"] = f"SMTP Connection Failed on all ports ({SMTP_HOST}): {connection_error}"
-        return render_template("index.html", run=run, from_address=SMTP_USER)
-
-    try:
-        for c in contacts:
-            tag = f"{c['name']} <{c['email']}> — {c['company']}"
-            try:
-                address = lookup_address(c["company"])
-                first_name = c["name"].split()[0] if c["name"] else ""
-                values = {
-                    "name": c["name"],
-                    "first_name": first_name,
-                    "company": c["company"],
-                    "address": address,
-                    "email": c["email"],
-                }
-                
-                customer_contact_field = f"{c['name']} ({c['email']})"
-                pdf_values = {**values, "name": customer_contact_field}
-                pdf_bytes = make_invoice(invoice_bytes, pdf_values, locations)
-                
-                safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
-                fname = f"Invoice_{safe}.pdf"
-
-                msg = EmailMessage()
-                msg["From"] = formataddr((FROM_NAME, SMTP_USER))
-                msg["To"] = c["email"]
-                msg["Subject"] = fill(subject_t, values)
-                msg.set_content(fill(body_t, values))
-                msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=fname)
-
-                server.send_message(msg)
-                run["results"].append({"tag": tag, "ok": True, "detail": "Sent"})
-                run["sent"] += 1
-                time.sleep(PAUSE_SECONDS)
-            except Exception as e:
-                run["results"].append({"tag": tag, "ok": False, "detail": str(e)})
-                run["failed"] += 1
-    finally:
-        if server:
-            try:
-                server.quit()
-            except Exception:
-                pass
-
-    return render_template("index.html", run=run, from_address=SMTP_USER)
+    return render_template("index.html", run=run, from_address=FROM_ADDRESS)
 
 
 if __name__ == "__main__":
