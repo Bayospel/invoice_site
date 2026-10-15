@@ -308,7 +308,6 @@ def send_invoices():
 
     run = {"results": [], "sent": 0, "failed": 0, "total": len(contacts), "account_issue": None}
 
-    # Set Resend API key dynamically from environment
     resend.api_key = os.environ.get("RESEND_API_KEY", "")
 
     if not resend.api_key:
@@ -335,9 +334,9 @@ def send_invoices():
             safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
             fname = f"Invoice_{safe}.pdf"
 
-            from_name = " ".join(c["company"].split())
+            sender_name = c["company"].strip()
             resend.Emails.send({
-                "from": f"{from_name} <{FROM_ADDRESS}>",
+                "from": f"{sender_name} <{FROM_ADDRESS}>",
                 "to": [c["email"]],
                 "subject": fill(subject_t, values),
                 "text": fill(body_t, values),
