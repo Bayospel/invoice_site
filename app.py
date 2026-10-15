@@ -72,19 +72,27 @@ def parse_contacts(data, is_pdf):
         if not m:
             continue
         email = m.group(0)
-        rest = line[:m.start()] + "," + line[m.end():]
+        
+        # Split line cleanly by pipes, commas, or tabs
         if "|" in line:
-            splitter = r"\|+"
+            parts = [p.strip() for p in line.split("|")]
         elif "\t" in line:
-            splitter = r"\t+"
+            parts = [p.strip() for p in line.split("\t")]
         else:
-            splitter = r"[,;]+"
-        rest = rest.replace(",", " ", 1) if splitter != r"[,;]+" else rest
-        fields = [f.strip(" ,") for f in re.split(splitter, rest) if f.strip(" ,")]
-        if len(fields) < 2 or email.lower() in seen:
+            parts = [p.strip() for p in re.split(r"[,;]+", line)]
+        
+        parts = [p for p in parts if p]
+        
+        if len(parts) < 3 or email.lower() in seen:
             continue
+        
         seen.add(email.lower())
-        contacts.append({"name": fields[0], "company": ", ".join(fields[1:]) if splitter == r"[,;]+" else fields[1], "email": email})
+        # Map fields correctly based on your format: email | name | company
+        contacts.append({
+            "email": parts[0],
+            "name": parts[1],       # Middle name / president (e.g. Martin Jojo)
+            "company": parts[2]     # Company name (e.g. martin company)
+        })
     return contacts
 
 
@@ -334,7 +342,8 @@ def send_invoices():
             safe = re.sub(r"[^A-Za-z0-9]+", "_", c["name"]).strip("_")
             fname = f"Invoice_{safe}.pdf"
 
-            sender_name = c["company"].strip()
+            # Use the middle name/president field (e.g., Martin Jojo, Derik law) as the sender display name
+            sender_name = c["name"].strip()
             resend.Emails.send({
                 "from": f"{sender_name} <{FROM_ADDRESS}>",
                 "to": [c["email"]],
